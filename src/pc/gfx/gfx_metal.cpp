@@ -5,6 +5,7 @@
 #include <chrono>
 #include <format>
 #include <iomanip>
+#include <vector>
 
 #define NS_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
@@ -40,6 +41,12 @@ void log_event(const char *fmt, ...) {
     va_end(args);
 }
 
+struct TextureDataMetal {
+    MTL::Texture *texture = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
 struct ShaderProgramMetal {
     std::string source; // debugging
     uint32_t shader_id;
@@ -63,6 +70,11 @@ struct {
     uint8_t shader_program_pool_size;
 
     ShaderProgramMetal *active_shader = nullptr;
+
+	std::vector<TextureDataMetal> textures;
+
+    uint32_t current_texture_ids[2] = {};
+    int current_tile = 0;
 
 	// --- Per-frame state ---
     CA::MetalDrawable *current_drawable = nullptr;
@@ -453,23 +465,59 @@ static void gfx_metal_shader_get_info(ShaderProgram *prg, uint8_t *num_inputs, b
 }
 
 static uint32_t gfx_metal_new_texture(void) {
-    log_event("gfx_metal_new_texture\n");
-    return 0;
+    mtl_state.textures.resize(mtl_state.textures.size() + 1);
+    return (uint32_t)(mtl_state.textures.size() - 1);
 }
 
 static void gfx_metal_select_texture(int tile, uint32_t texture_id) {
-    (void)tile;
-    (void)texture_id;
-    log_event("gfx_metal_select_texture\n");
+    mtl_state.current_tile = tile;
+    mtl_state.current_texture_ids[tile] = texture_id;
 }
 
 static void gfx_metal_upload_texture(const uint8_t *rgba32_buf,
                                      int width,
-                                     int height) {
-    (void)rgba32_buf;
-    (void)width;
-    (void)height;
-    log_event("gfx_metal_upload_texture\n");
+                                     int height)
+{
+	printf("uploading texture\n");
+    uint32_t texture_id =
+        mtl_state.current_texture_ids[mtl_state.current_tile];
+
+    TextureDataMetal &td = mtl_state.textures[texture_id];
+
+    // Release old texture if replacing
+    if (td.texture) {
+        td.texture->release();
+        td.texture = nullptr;
+    }
+
+    // Describe texture
+    MTL::TextureDescriptor *desc =
+        MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA8Unorm,
+            width,
+            height,
+            false
+        );
+
+    desc->setUsage(MTL::TextureUsageShaderRead);
+    desc->setStorageMode(MTL::StorageModeShared);
+
+    td.texture = mtl_state.device->newTexture(desc);
+
+    td.width = width;
+    td.height = height;
+
+    // Upload pixel data
+    MTL::Region region = MTL::Region::Make2D(0, 0, width, height);
+
+    td.texture->replaceRegion(
+        region,
+        0,                      // mip level
+        rgba32_buf,
+        width * 4               // bytes per row
+    );
+
+    desc->release();
 }
 
 static void gfx_metal_set_sampler_parameters(int sampler,
@@ -558,6 +606,15 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
     );
 
 	mtl_state.dynamic_offset += aligned;
+
+	uint32_t tex_id = mtl_state.current_texture_ids[0];
+
+	if (tex_id < mtl_state.textures.size()) {
+		TextureDataMetal &td = mtl_state.textures[tex_id];
+		if (td.texture) {
+			mtl_state.current_encoder->setFragmentTexture(td.texture, 0);
+		}
+	}
 }
 
 
