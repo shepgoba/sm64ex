@@ -14,6 +14,7 @@
 #include <Metal/Metal.hpp>
 #include <QuartzCore/QuartzCore.hpp>
 
+#include <PR/gbi.h>
 
 #include "gfx_rendering_api.h"
 #include "gfx_cc.h"
@@ -23,7 +24,7 @@
 #include "gfx_sdl.h"
 
 void log_event(const char *fmt, ...) {
-    return;
+	return;
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
 
@@ -38,6 +39,7 @@ void log_event(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
+    fputc('\n', stdout);
     va_end(args);
 }
 
@@ -45,6 +47,7 @@ struct TextureDataMetal {
     MTL::Texture *texture = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t sampler_parameters = 0;
 };
 
 struct ShaderProgramMetal {
@@ -60,30 +63,37 @@ struct ShaderProgramMetal {
 };
 
 struct {
+    // long life stuff
     CA::MetalLayer *layer = nullptr;
     MTL::Device *device = nullptr;
     MTL::CommandQueue *queue = nullptr;
 
-    MTL::Viewport viewport;
-
     struct ShaderProgramMetal shader_program_pool[64];
-    uint8_t shader_program_pool_size;
+    uint8_t shader_program_pool_size = 0;
 
+    std::vector<TextureDataMetal> textures;
+    std::vector<MTL::SamplerState *> samplers;
+
+	MTL::Buffer *dynamic_vertex_buffer = nullptr;
+    size_t dynamic_offset = 0;
+
+    // state stuff
+    MTL::Viewport viewport;
+    MTL::ScissorRect scissor;
     ShaderProgramMetal *active_shader = nullptr;
-
-	std::vector<TextureDataMetal> textures;
-
     uint32_t current_texture_ids[2] = {};
     int current_tile = 0;
 
-	// --- Per-frame state ---
+    // depth stuff
+    bool depth_mask = false;
+    bool depth_test = false;
+    MTL::DepthStencilState *depth_state = nullptr;
+
+	// per frame stuff
     CA::MetalDrawable *current_drawable = nullptr;
     MTL::CommandBuffer *current_cmd_buffer = nullptr;
     MTL::RenderCommandEncoder *current_encoder = nullptr;
     MTL::RenderPassDescriptor *current_pass_desc = nullptr;
-
-	MTL::Buffer *dynamic_vertex_buffer = nullptr;
-    size_t dynamic_offset = 0;
 
 } mtl_state;
 
@@ -316,21 +326,11 @@ out.pos = in.pos;
 
     std::string fs;
 
-    // Header
-    fs += "#include <metal_stdlib>\n";
-    fs += "using namespace metal;\n\n";
 
-
-    // Uniforms
-    fs += "struct FragmentUniforms {\n";
-    if (ccf.used_textures[0]) fs += "    float2 uTex0Size;\n    uint uTex0Filter;\n";
-    if (ccf.used_textures[1]) fs += "    float2 uTex1Size;\n    uint uTex1Filter;\n";
-    if (ccf.opt_alpha && ccf.opt_noise) fs += "    float frame_count;\n";
-    fs += "};\n\n";
 
     // Sampling helper
     if (ccf.used_textures[0] || ccf.used_textures[1]) {
-        fs += "float4 sampleTex(texture2d<float> tex, sampler samp, float2 uv, float2 texSize, uint dofilter) {\n";
+        fs += "float4 sampleTex(texture2d<float> tex, sampler samp, float2 uv, float2 texSize) {\n";
         if (configFiltering == 2) {
             fs += "    float2 offset = fract(uv * texSize - float2(0.5));\n";
             fs += "    offset -= step(1.0, offset.x + offset.y);\n";
@@ -355,8 +355,7 @@ out.pos = in.pos;
 
     // Fragment function
     fs += "fragment float4 fragment_main(\n";
-    fs += "    VertexOut in [[stage_in]],\n";
-    fs += "    constant FragmentUniforms& uniforms [[buffer(0)]]\n";
+    fs += "    VertexOut in [[stage_in]]\n";
     if (ccf.used_textures[0] || ccf.used_textures[1]) {
         fs += ",";
     }
@@ -369,12 +368,13 @@ out.pos = in.pos;
     fs += ") {\n";
 
     // Sample textures
-    if (ccf.used_textures[0]) fs += "    float4 texVal0 = sampleTex(uTex0, samp0, in.tex_coord, uniforms.uTex0Size, uniforms.uTex0Filter);\n";
-    if (ccf.used_textures[1]) fs += "    float4 texVal1 = sampleTex(uTex1, samp1, in.tex_coord, uniforms.uTex1Size, uniforms.uTex1Filter);\n";
+    if (ccf.used_textures[0]) fs += "    float4 texVal0 = sampleTex(uTex0, samp0, in.tex_coord, float2(uTex0.get_width(), uTex0.get_height()));\n";
+    if (ccf.used_textures[1]) fs += "    float4 texVal1 = sampleTex(uTex1, samp1, in.tex_coord, float2(uTex1.get_width(), uTex1.get_height()));\n";
 
     std::string formula = generate_formula(ccf.c, ccf.do_single[0], ccf.do_multiply[0], ccf.do_mix[0], ccf.opt_alpha, false, ccf.opt_alpha);
     fs += ccf.opt_alpha ? "float4" : "float3";
     fs += " texel = " + formula + ";\n";
+
 
     // Edge alpha
     if (ccf.opt_texture_edge && ccf.opt_alpha)
@@ -388,17 +388,16 @@ out.pos = in.pos;
 
     // Noise alpha
     if (ccf.opt_alpha && ccf.opt_noise)
-        fs += "    texel.a *= floor(random(float3(floor(in.pos.xy), uniforms.frame_count)) + 0.5);\n";
+        fs += "    texel.a *= floor(random(float3(floor(in.pos.xy), 67)) + 0.5);\n";
 
     // Return
     fs += ccf.opt_alpha ? "    return texel;\n" : "    return float4(texel, 1.0);\n";
 
     fs += "}\n";
 
-
     std::string shader_combined_source = vertex_shader_source + fs;
-   // std::string shader_name = "mtlShader" + std::to_string(shader_id);
-    std::cout << shader_combined_source << '\n';
+     std::cout << shader_combined_source << '\n';
+
     NS::Error *error = nullptr;
     auto library = mtl_state.device->newLibrary(
         NS::String::string(shader_combined_source.c_str(), NS::StringEncoding::UTF8StringEncoding), nullptr, &error);
@@ -409,7 +408,6 @@ out.pos = in.pos;
 
     vertexDescriptor->layouts()->object(0)->setStride(num_floats * sizeof(float));
     vertexDescriptor->layouts()->object(0)->setStepFunction(MTL::VertexStepFunctionPerVertex);
-    vertexDescriptor->layouts()->object(0)->setStepRate(1);
 
 	ShaderProgramMetal *prg = &mtl_state.shader_program_pool[mtl_state.shader_program_pool_size++];
     prg->shader_id = shader_id;
@@ -442,7 +440,7 @@ out.pos = in.pos;
 
 	prg->pipeline = pipelineState;
 
-	printf("new shader made\n");
+	log_event("created new shader");
     gfx_metal_load_shader(reinterpret_cast<ShaderProgram *>(prg));
     return reinterpret_cast<ShaderProgram *>(prg);
 }
@@ -470,17 +468,18 @@ static uint32_t gfx_metal_new_texture(void) {
 }
 
 static void gfx_metal_select_texture(int tile, uint32_t texture_id) {
+    //std::cout << "selecting texture " << texture_id <<std::endl;
     mtl_state.current_tile = tile;
     mtl_state.current_texture_ids[tile] = texture_id;
 }
+
 
 static void gfx_metal_upload_texture(const uint8_t *rgba32_buf,
                                      int width,
                                      int height)
 {
-	printf("uploading texture\n");
-    uint32_t texture_id =
-        mtl_state.current_texture_ids[mtl_state.current_tile];
+    uint32_t texture_id = mtl_state.current_texture_ids[mtl_state.current_tile];
+	log_event("uploading texture %ix%i with id=%i", width, height, texture_id);
 
     TextureDataMetal &td = mtl_state.textures[texture_id];
 
@@ -514,36 +513,40 @@ static void gfx_metal_upload_texture(const uint8_t *rgba32_buf,
         region,
         0,                      // mip level
         rgba32_buf,
-        width * 4               // bytes per row
+        width * 4
     );
 
     desc->release();
 }
 
-static void gfx_metal_set_sampler_parameters(int sampler,
+static int gfx_cm_to_index(uint32_t val) {
+    if (val & G_TX_CLAMP) {
+        return 2;
+    }
+    return (val & G_TX_MIRROR) ? 1 : 0;
+}
+
+static void gfx_metal_set_sampler_parameters(int tile,
                                              bool linear_filter,
                                              uint32_t cms,
                                              uint32_t cmt) {
-    (void)sampler;
-    (void)linear_filter;
-    (void)cms;
-    (void)cmt;
-    log_event("gfx_metal_set_sampler_parameters\n");
+    log_event("setting sampler parameters\n");
+    mtl_state.textures[mtl_state.current_texture_ids[tile]].sampler_parameters = linear_filter * 9 + gfx_cm_to_index(cms) * 3 + gfx_cm_to_index(cmt);
 }
 
 static void gfx_metal_set_depth_test(bool depth_test) {
-    (void)depth_test;
-    log_event("gfx_metal_set_depth_test\n");
+    log_event("setting depth test");
+    mtl_state.depth_test = depth_test;
 }
 
 static void gfx_metal_set_depth_mask(bool z_upd) {
-    (void)z_upd;
-    log_event("gfx_metal_set_depth_mask\n");
+    log_event("setting depth mask");
+    mtl_state.depth_mask = z_upd;
 }
 
 static void gfx_metal_set_zmode_decal(bool zmode_decal) {
     (void)zmode_decal;
-    log_event("gfx_metal_set_zmode_decal\n");
+    log_event("gfx_metal_set_zmode_decal");
 }
 
 static void gfx_metal_set_viewport(int x, int y, int width, int height) {
@@ -558,30 +561,54 @@ static void gfx_metal_set_viewport(int x, int y, int width, int height) {
         static_cast<double>(width), 
         static_cast<double>(height)
     };
+    std::cout << std::format("[gfx_metal_set_viewport] x: {}, y: {}, w: {}, h: {}\n", x, y, width, height);
     mtl_state.viewport = viewport;
 }
 
 static void gfx_metal_set_scissor(int x, int y, int width, int height) {
-    (void)x;
-    (void)y;
-    (void)width;
-    (void)height;
-    log_event("gfx_metal_set_scissor\n");
+    MTL::ScissorRect scissor{
+        static_cast<NS::UInteger>(x), 
+        static_cast<NS::UInteger>(y), 
+        static_cast<NS::UInteger>(width), 
+        static_cast<NS::UInteger>(height)
+    };
+    //std::cout << std::format("[gfx_metal_set_scissor] x: {}, y: {}, w: {}, h: {}\n", x, y, width, height);
+    mtl_state.scissor = scissor;
 }
 
 static void gfx_metal_set_use_alpha(bool use_alpha) {
-    (void)use_alpha;
-    log_event("gfx_metal_set_use_alpha\n");
+    // part of the state from shader info i think
 }
 
 static void gfx_metal_draw_triangles(float buf_vbo[],
                                      size_t buf_vbo_len,
                                      size_t buf_vbo_num_tris)
 {
-    if (!mtl_state.current_encoder) return;
+    if (!mtl_state.current_encoder) {
+        log_event("render encoder is nil");
+        exit(-1);
+    }
+    MTL::DepthStencilDescriptor *depth_desc = MTL::DepthStencilDescriptor::alloc()->init();
+        
+    // std::cout << "depth_test = " << (mtl_state.depth_test ? "yes" : "no");
+    depth_desc->setDepthCompareFunction(
+        mtl_state.depth_test ? MTL::CompareFunctionLessEqual
+                            : MTL::CompareFunctionAlways);
+
+    depth_desc->setDepthWriteEnabled(mtl_state.depth_mask);
+
+    if (mtl_state.depth_state)
+        mtl_state.depth_state->release();
+
+    mtl_state.depth_state = mtl_state.device->newDepthStencilState(depth_desc);
+    depth_desc->release();
+
+    mtl_state.current_encoder->setDepthStencilState(mtl_state.depth_state);
 
     mtl_state.current_encoder->setRenderPipelineState(
         mtl_state.active_shader->pipeline);
+
+    mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
 
 	size_t size = buf_vbo_len * sizeof(float);
 
@@ -592,8 +619,25 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 				+ mtl_state.dynamic_offset;
 
 	memcpy(dst, buf_vbo, size);
+	if (mtl_state.active_shader->used_textures[0]) {
+		uint32_t tex_id1 = mtl_state.current_texture_ids[0];
+		TextureDataMetal &td = mtl_state.textures[tex_id1];
+		int index = td.sampler_parameters;
 
-	mtl_state.current_encoder->setVertexBuffer(
+		mtl_state.current_encoder->setFragmentTexture(td.texture, 0);
+		mtl_state.current_encoder->setFragmentSamplerState(mtl_state.samplers[index], 0);
+		//std::cout << "drawing texture with id=" << tex_id1 << '\n';
+	}
+	if (mtl_state.active_shader->used_textures[1]) {
+		uint32_t tex_id1 = mtl_state.current_texture_ids[1];
+		TextureDataMetal &td = mtl_state.textures[tex_id1];
+		int index = td.sampler_parameters;
+
+		mtl_state.current_encoder->setFragmentTexture(td.texture, 1);
+		mtl_state.current_encoder->setFragmentSamplerState(mtl_state.samplers[index], 0);
+	}
+
+		mtl_state.current_encoder->setVertexBuffer(
 		mtl_state.dynamic_vertex_buffer,
 		mtl_state.dynamic_offset,
 		0
@@ -607,14 +651,6 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 
 	mtl_state.dynamic_offset += aligned;
 
-	uint32_t tex_id = mtl_state.current_texture_ids[0];
-
-	if (tex_id < mtl_state.textures.size()) {
-		TextureDataMetal &td = mtl_state.textures[tex_id];
-		if (td.texture) {
-			mtl_state.current_encoder->setFragmentTexture(td.texture, 0);
-		}
-	}
 }
 
 
@@ -631,6 +667,41 @@ static void gfx_metal_init(void) {
 		);
 
 	mtl_state.dynamic_offset = 0;
+
+    for (int linear_filter = 0; linear_filter < 2; linear_filter++) {
+        for (int cms = 0; cms < 3; cms++) {
+            for (int cmt = 0; cmt < 3; cmt++) {
+                MTL::SamplerDescriptor *desc = MTL::SamplerDescriptor::alloc()->init();
+
+                // Filter
+                auto filter = linear_filter ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+                desc->setMinFilter(filter);
+                desc->setMagFilter(filter);
+                desc->setMipFilter(linear_filter ? MTL::SamplerMipFilterLinear : MTL::SamplerMipFilterNearest);
+
+                // Address modes
+                // Replace address_modes[cms/cmt] with your mapping: D3D12_WRAP -> MTL::SamplerAddressModeRepeat, etc.
+                desc->setSAddressMode(cms == 0 ? MTL::SamplerAddressModeRepeat : (cms == 1 ? MTL::SamplerAddressModeMirrorRepeat : MTL::SamplerAddressModeClampToEdge));
+                desc->setTAddressMode(cmt == 0 ? MTL::SamplerAddressModeRepeat : (cmt == 1 ? MTL::SamplerAddressModeMirrorRepeat : MTL::SamplerAddressModeClampToEdge));
+                desc->setRAddressMode(MTL::SamplerAddressModeRepeat); // W always wrap
+
+                // LOD / Anisotropy
+                desc->setLodMinClamp(0.0f);
+                desc->setLodMaxClamp(FLT_MAX);
+                desc->setLodBias(0.0f);
+                desc->setMaxAnisotropy(1);
+
+                MTL::SamplerState *sampler = mtl_state.device->newSamplerState(desc);
+				if (!sampler) {
+					std::cout << "failed to alloc sampler\n";
+					exit(-1);
+				}
+                desc->release();
+
+                mtl_state.samplers.push_back(sampler); // store for later binding
+            }
+        }
+    }
 }
 
 static void gfx_metal_on_resize(void) {
@@ -674,10 +745,17 @@ static void gfx_metal_end_frame(void) {
     mtl_state.current_cmd_buffer->commit();
 
     // Reset per-frame state
+	mtl_state.current_encoder->release();
     mtl_state.current_encoder = nullptr;
-    mtl_state.current_cmd_buffer = nullptr;
-    mtl_state.current_drawable = nullptr;
+
+	mtl_state.current_pass_desc->release();
     mtl_state.current_pass_desc = nullptr;
+
+	mtl_state.current_cmd_buffer->release();
+	mtl_state.current_cmd_buffer = nullptr;
+
+    mtl_state.current_drawable = nullptr;
+
 
 	mtl_state.dynamic_offset = 0;
 }
