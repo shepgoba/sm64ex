@@ -89,7 +89,9 @@ struct {
     // depth stuff
     bool depth_mask = false;
     bool depth_test = false;
-    MTL::DepthStencilState *depth_state = nullptr;
+	bool zmode_decal = false;
+    MTL::DepthStencilState *depth_states[2] = {};
+	MTL::DepthStencilState *depth_state_disabled = nullptr;
 
 	// per frame stuff
     CA::MetalDrawable *current_drawable = nullptr;
@@ -403,7 +405,7 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) {
 }
 	)";*/
     std::string shader_combined_source = vertex_shader_source + fs;
-     std::cout << shader_combined_source << '\n';
+    //std::cout << shader_combined_source << '\n';
 
     NS::Error *error = nullptr;
     auto library = mtl_state.device->newLibrary(
@@ -571,8 +573,8 @@ static void gfx_metal_set_depth_mask(bool z_upd) {
 }
 
 static void gfx_metal_set_zmode_decal(bool zmode_decal) {
-    (void)zmode_decal;
-    log_event("gfx_metal_set_zmode_decal");
+	log_event("setting zmode_decal=%i", zmode_decal);
+    mtl_state.zmode_decal = zmode_decal;
 }
 
 static void gfx_metal_set_viewport(int x, int y, int width, int height) {
@@ -612,23 +614,19 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 {
 	mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
 
-    MTL::DepthStencilDescriptor *depth_desc = MTL::DepthStencilDescriptor::alloc()->init();
-	depth_desc->setDepthCompareFunction(mtl_state.depth_mask ? MTL::CompareFunctionLessEqual : MTL::CompareFunctionAlways);
-    depth_desc->setDepthWriteEnabled(mtl_state.depth_test);
-
-    auto depth_state = mtl_state.device->newDepthStencilState(depth_desc);
-    depth_desc->release();
-
-    mtl_state.current_encoder->setDepthStencilState(depth_state);
-	
-
-
-    if (mtl_state.depth_state)
-        mtl_state.depth_state->release();
-
-
-    mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
-
+	if (mtl_state.zmode_decal) {
+		float slopeScale = 2.0f;       // equivalent of SlopeScaledDepthBias
+		float clamp = 0.0f;            // max bias, optional
+		float constantBias = -1e-5f;   // tiny offset to avoid equality
+		mtl_state.current_encoder->setDepthBias(slopeScale, clamp, constantBias);
+	}
+	if (mtl_state.depth_test) {
+    	mtl_state.current_encoder->setDepthStencilState(mtl_state.depth_states[mtl_state.depth_mask ? 1 : 0]);
+		printf("using depth state enabled, mask=%i\n", mtl_state.depth_mask);
+	} else {
+		mtl_state.current_encoder->setDepthStencilState(mtl_state.depth_state_disabled);
+		printf("using depth state disabled\n");
+	}
 
 	if (mtl_state.active_shader->used_textures[0]) {
 		uint32_t tex_id1 = mtl_state.current_texture_ids[0];
@@ -637,8 +635,8 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 
 		mtl_state.current_encoder->setFragmentTexture(td.texture, 0);
 		mtl_state.current_encoder->setFragmentSamplerState(mtl_state.samplers[index], 0);
-		//std::cout << "drawing texture with id=" << tex_id1 << '\n';
 	}
+
 	if (mtl_state.active_shader->used_textures[1]) {
 		uint32_t tex_id1 = mtl_state.current_texture_ids[1];
 		TextureDataMetal &td = mtl_state.textures[tex_id1];
@@ -678,6 +676,7 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 static void gfx_metal_init(void) {
     mtl_state.layer = static_cast<CA::MetalLayer *>(gfx_sdl_get_layer());
     mtl_state.device = MTL::CreateSystemDefaultDevice();
+	printf("[metal] using device %s\n", mtl_state.device->name()->utf8String());
     mtl_state.layer->setDevice(mtl_state.device);
     mtl_state.queue = mtl_state.device->newCommandQueue();
 
@@ -692,10 +691,10 @@ static void gfx_metal_init(void) {
 	auto sz = mtl_state.layer->drawableSize();
 
 	// Get width and height
-	uint32_t width = sz.width;
-	uint32_t height = sz.height;
+	NS::UInteger width = sz.width;
+	NS::UInteger height = sz.height;
 
-	MTL::TextureDescriptor* depth_text_desc = MTL::TextureDescriptor::texture2DDescriptor(
+	MTL::TextureDescriptor *depth_text_desc = MTL::TextureDescriptor::texture2DDescriptor(
 		MTL::PixelFormatDepth32Float, 
 		width, 
 		height,
@@ -710,6 +709,25 @@ static void gfx_metal_init(void) {
 		std::cout << "failed to make depth texture\n";
 		exit(-1);
 	}
+
+	auto d = MTL::DepthStencilDescriptor::alloc()->init();
+	d->setDepthCompareFunction(MTL::CompareFunctionAlways);
+	d->setDepthWriteEnabled(false);
+	mtl_state.depth_state_disabled = mtl_state.device->newDepthStencilState(d);
+	d->release();
+
+	d = MTL::DepthStencilDescriptor::alloc()->init();
+	d->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
+	d->setDepthWriteEnabled(false);
+	mtl_state.depth_states[0] = mtl_state.device->newDepthStencilState(d);
+	d->release();
+
+	d = MTL::DepthStencilDescriptor::alloc()->init();
+	d->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
+	d->setDepthWriteEnabled(true);
+	mtl_state.depth_states[1] = mtl_state.device->newDepthStencilState(d);
+	d->release();
+
 
     for (int linear_filter = 0; linear_filter < 2; linear_filter++) {
         for (int cms = 0; cms < 3; cms++) {
@@ -765,7 +783,7 @@ static void gfx_metal_start_frame(void) {
 	auto depthAttachment =  mtl_state.current_pass_desc->depthAttachment();
 	depthAttachment->setTexture(mtl_state.depth_texture);
 	depthAttachment->setLoadAction(MTL::LoadActionClear);
-	//depthAttachment->setStoreAction(MTL::StoreActionDontCare);
+	depthAttachment->setStoreAction(MTL::StoreActionDontCare);
 	depthAttachment->setClearDepth(1.0f);
 
 	mtl_state.current_pass_desc->setDepthAttachment(depthAttachment);
@@ -777,6 +795,7 @@ static void gfx_metal_start_frame(void) {
             mtl_state.current_pass_desc);
 
     mtl_state.current_encoder->setViewport(mtl_state.viewport);
+	mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
 }
 
 
@@ -812,6 +831,7 @@ static void gfx_metal_end_frame(void) {
 }
 
 static void gfx_metal_shutdown(void) {
+	// TODO: free stuff
 }
 
 GfxRenderingAPI gfx_metal_api = {
