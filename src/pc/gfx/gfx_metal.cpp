@@ -68,6 +68,8 @@ struct {
     MTL::Device *device = nullptr;
     MTL::CommandQueue *queue = nullptr;
 
+	MTL::Texture *depth_texture = nullptr;
+
     struct ShaderProgramMetal shader_program_pool[64];
     uint8_t shader_program_pool_size = 0;
 
@@ -395,6 +397,11 @@ out.pos = in.pos;
 
     fs += "}\n";
 
+	/*fs = R"(
+fragment float4 fragment_main(VertexOut in [[stage_in]]) {
+    return float4(in.pos.z, in.pos.z, in.pos.z, 1.0);
+}
+	)";*/
     std::string shader_combined_source = vertex_shader_source + fs;
      std::cout << shader_combined_source << '\n';
 
@@ -427,8 +434,27 @@ out.pos = in.pos;
 	auto pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
 	pipelineDesc->setVertexFunction(vertexFunc);
 	pipelineDesc->setFragmentFunction(fragmentFunc);
-	pipelineDesc->setVertexDescriptor(prg->vertex_descriptor); 
-	pipelineDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+	pipelineDesc->setVertexDescriptor(prg->vertex_descriptor);
+	pipelineDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+
+
+	auto colorAttachment = pipelineDesc->colorAttachments()->object(0);
+	colorAttachment->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+
+	if (ccf.opt_alpha) {
+		colorAttachment->setBlendingEnabled(true);
+		colorAttachment->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
+		colorAttachment->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+		colorAttachment->setRgbBlendOperation(MTL::BlendOperationAdd);
+		colorAttachment->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+		colorAttachment->setDestinationAlphaBlendFactor(MTL::BlendFactorZero);
+		colorAttachment->setAlphaBlendOperation(MTL::BlendOperationAdd);
+		colorAttachment->setWriteMask(MTL::ColorWriteMaskAll);
+	} else {
+		colorAttachment->setBlendingEnabled(false);
+		colorAttachment->setWriteMask(MTL::ColorWriteMaskAll);
+	}
+
 
 	auto pipelineState = mtl_state.device->newRenderPipelineState(pipelineDesc, &error);
 
@@ -584,41 +610,26 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
                                      size_t buf_vbo_len,
                                      size_t buf_vbo_num_tris)
 {
-    if (!mtl_state.current_encoder) {
-        log_event("render encoder is nil");
-        exit(-1);
-    }
-    MTL::DepthStencilDescriptor *depth_desc = MTL::DepthStencilDescriptor::alloc()->init();
-        
-    // std::cout << "depth_test = " << (mtl_state.depth_test ? "yes" : "no");
-    depth_desc->setDepthCompareFunction(
-        mtl_state.depth_test ? MTL::CompareFunctionLessEqual
-                            : MTL::CompareFunctionAlways);
+	mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
 
-    depth_desc->setDepthWriteEnabled(mtl_state.depth_mask);
+    MTL::DepthStencilDescriptor *depth_desc = MTL::DepthStencilDescriptor::alloc()->init();
+	depth_desc->setDepthCompareFunction(mtl_state.depth_mask ? MTL::CompareFunctionLessEqual : MTL::CompareFunctionAlways);
+    depth_desc->setDepthWriteEnabled(mtl_state.depth_test);
+
+    auto depth_state = mtl_state.device->newDepthStencilState(depth_desc);
+    depth_desc->release();
+
+    mtl_state.current_encoder->setDepthStencilState(depth_state);
+	
+
 
     if (mtl_state.depth_state)
         mtl_state.depth_state->release();
 
-    mtl_state.depth_state = mtl_state.device->newDepthStencilState(depth_desc);
-    depth_desc->release();
-
-    mtl_state.current_encoder->setDepthStencilState(mtl_state.depth_state);
-
-    mtl_state.current_encoder->setRenderPipelineState(
-        mtl_state.active_shader->pipeline);
 
     mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
 
-	size_t size = buf_vbo_len * sizeof(float);
 
-	// Align to 256 bytes (required by Metal)
-	size_t aligned = (size + 255) & ~255;
-
-	void* dst = (uint8_t*)mtl_state.dynamic_vertex_buffer->contents()
-				+ mtl_state.dynamic_offset;
-
-	memcpy(dst, buf_vbo, size);
 	if (mtl_state.active_shader->used_textures[0]) {
 		uint32_t tex_id1 = mtl_state.current_texture_ids[0];
 		TextureDataMetal &td = mtl_state.textures[tex_id1];
@@ -636,8 +647,18 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 		mtl_state.current_encoder->setFragmentTexture(td.texture, 1);
 		mtl_state.current_encoder->setFragmentSamplerState(mtl_state.samplers[index], 0);
 	}
+	
+	size_t size = buf_vbo_len * sizeof(float);
 
-		mtl_state.current_encoder->setVertexBuffer(
+	// Align to 256 bytes (required by Metal)
+	size_t aligned = (size + 255) & ~255;
+
+	void* dst = (uint8_t*)mtl_state.dynamic_vertex_buffer->contents()
+				+ mtl_state.dynamic_offset;
+
+	memcpy(dst, buf_vbo, size);
+	
+	mtl_state.current_encoder->setVertexBuffer(
 		mtl_state.dynamic_vertex_buffer,
 		mtl_state.dynamic_offset,
 		0
@@ -667,6 +688,28 @@ static void gfx_metal_init(void) {
 		);
 
 	mtl_state.dynamic_offset = 0;
+	
+	auto sz = mtl_state.layer->drawableSize();
+
+	// Get width and height
+	uint32_t width = sz.width;
+	uint32_t height = sz.height;
+
+	MTL::TextureDescriptor* depth_text_desc = MTL::TextureDescriptor::texture2DDescriptor(
+		MTL::PixelFormatDepth32Float, 
+		width, 
+		height,
+		false                      // not mipmapped
+	);
+
+	depth_text_desc->setUsage(MTL::TextureUsageRenderTarget);
+	depth_text_desc->setStorageMode(MTL::StorageModePrivate);
+
+	mtl_state.depth_texture = mtl_state.device->newTexture(depth_text_desc);
+	if (!mtl_state.depth_texture) {
+		std::cout << "failed to make depth texture\n";
+		exit(-1);
+	}
 
     for (int linear_filter = 0; linear_filter < 2; linear_filter++) {
         for (int cms = 0; cms < 3; cms++) {
@@ -718,6 +761,14 @@ static void gfx_metal_start_frame(void) {
     color->setLoadAction(MTL::LoadActionClear);
     color->setStoreAction(MTL::StoreActionStore);
     color->setClearColor(MTL::ClearColor(0.1, 0.1, 0.1, 1.0));
+
+	auto depthAttachment =  mtl_state.current_pass_desc->depthAttachment();
+	depthAttachment->setTexture(mtl_state.depth_texture);
+	depthAttachment->setLoadAction(MTL::LoadActionClear);
+	//depthAttachment->setStoreAction(MTL::StoreActionDontCare);
+	depthAttachment->setClearDepth(1.0f);
+
+	mtl_state.current_pass_desc->setDepthAttachment(depthAttachment);
 
     mtl_state.current_cmd_buffer = mtl_state.queue->commandBuffer();
 
