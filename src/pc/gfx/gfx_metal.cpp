@@ -95,7 +95,8 @@ struct {
     bool last_depth_mask = false;
     bool last_depth_test = false;
     bool last_zmode_decal = false;
-    uint32_t previous_texture_ids[2] = {};
+    // force these to be different from current_texture_ids so the comparison passes on the first run
+    uint32_t previous_texture_ids[2] = {0xffffffff, 0xffffffff};
 
     // depth stuff
     bool depth_mask = false;
@@ -587,8 +588,14 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
                                      size_t buf_vbo_len,
                                      size_t buf_vbo_num_tris)
 {
+	// do nothing if we failed to get drawable
+	if (!mtl_state.current_drawable) {
+    	return;
+    }
+
     if (mtl_state.active_shader != mtl_state.last_shader) {
         mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
+        mtl_state.last_shader = mtl_state.active_shader;
     }
     if (mtl_state.zmode_decal != mtl_state.last_zmode_decal) {
         if (mtl_state.zmode_decal) {
@@ -748,8 +755,9 @@ static void gfx_metal_start_frame(void) {
     mtl_state.autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
     mtl_state.current_drawable = mtl_state.layer->nextDrawable();
+    // do nothing for this frame if we can't get a drawable
     if (!mtl_state.current_drawable) {
-    	log_error("Failed to get current drawable");
+    	return;
     }
     mtl_state.current_pass_desc = MTL::RenderPassDescriptor::renderPassDescriptor();
 
@@ -785,29 +793,36 @@ static void gfx_metal_start_frame(void) {
     mtl_state.current_encoder->setViewport(mtl_state.viewport);
     mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
     mtl_state.current_encoder->setDepthClipMode(MTL::DepthClipModeClamp);
+
+    // must always set the encoder to a pipeline state
+    mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
+    mtl_state.last_shader = mtl_state.active_shader;
 }
 
 static void gfx_metal_finish_render(void) {
-    if (mtl_state.current_cmd_buffer) {
-        mtl_state.current_cmd_buffer->waitUntilCompleted();
-    }
 }
 
 static void gfx_metal_end_frame(void) {
+	// like start_frame and draw triangles, skip this frame
+	if (!mtl_state.current_drawable) {
+    	goto done;
+    }
+
     mtl_state.current_encoder->endEncoding();
 
     mtl_state.current_cmd_buffer->presentDrawable(
         mtl_state.current_drawable);
 
     mtl_state.current_cmd_buffer->commit();
-
+    // lazy way but it works
+    mtl_state.current_cmd_buffer->waitUntilCompleted();
     mtl_state.dynamic_offset = 0;
 
     mtl_state.current_encoder = nullptr;
     mtl_state.current_drawable = nullptr;
     mtl_state.current_cmd_buffer = nullptr;
     mtl_state.current_pass_desc = nullptr;
-
+done:
     mtl_state.autorelease_pool->drain();
     mtl_state.autorelease_pool = nullptr;
 }
