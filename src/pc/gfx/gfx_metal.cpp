@@ -106,6 +106,7 @@ struct {
     bool depth_mask = false;
     bool depth_test = false;
     bool zmode_decal = false;
+    bool needs_resize_depth = false;
     MTL::DepthStencilState *depth_states[2] = {};
     MTL::DepthStencilState *depth_state_disabled = nullptr;
 
@@ -571,6 +572,8 @@ static void gfx_metal_set_viewport(int x, int y, int width, int height) {
     };
     mtl_state.viewport = viewport;
     mtl_state.viewport_did_change = true;
+    mtl_state.needs_resize_depth = true;
+    mtl_state.layer->setDrawableSize(CGSizeMake(width, height));
 }
 
 static void gfx_metal_set_scissor(int x, int y, int width, int height) {
@@ -766,6 +769,11 @@ static void gfx_metal_on_resize(void) {
 static void gfx_metal_start_frame(void) {
     mtl_state.autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
+    if (mtl_state.needs_resize_depth) {
+        create_depth_texture(mtl_state.viewport.width, mtl_state.viewport.height);
+        mtl_state.needs_resize_depth = false;
+    }
+    
     mtl_state.current_drawable = mtl_state.layer->nextDrawable();
     // do nothing for this frame if we can't get a drawable
     if (!mtl_state.current_drawable) {
@@ -783,11 +791,6 @@ static void gfx_metal_start_frame(void) {
     u->noise_scale_y = mtl_state.viewport.height / 240.0f;
     if (u->noise_frame > 150) {
         u->noise_frame = 0;
-    }
-
-    if (mtl_state.viewport_did_change) {
-        create_depth_texture(mtl_state.viewport.width, mtl_state.viewport.height);
-        mtl_state.viewport_did_change = false;
     }
 
     auto color = mtl_state.current_pass_desc->colorAttachments()->object(0);
