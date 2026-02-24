@@ -782,7 +782,6 @@ static void gfx_metal_start_frame(void) {
         mtl_state.needs_resize_depth = false;
     }
 
-    printf("cw: %i, %i\n", mtl_state.current_width, mtl_state.current_height);
     mtl_state.current_pass_desc = MTL::RenderPassDescriptor::renderPassDescriptor();
 
     MetalUniforms *u = (MetalUniforms *)mtl_state.uniforms_buffer->contents();
