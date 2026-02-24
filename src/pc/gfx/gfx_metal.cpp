@@ -564,7 +564,7 @@ static void gfx_metal_set_zmode_decal(bool zmode_decal) {
 static void gfx_metal_set_viewport(int x, int y, int width, int height) {
     MTL::Viewport viewport{
         static_cast<double>(x),
-        static_cast<double>(mtl_state.current_height - y - height),
+        static_cast<double>(y),
         static_cast<double>(width),
         static_cast<double>(height),
         0.0,
@@ -573,6 +573,8 @@ static void gfx_metal_set_viewport(int x, int y, int width, int height) {
     mtl_state.viewport = viewport;
     mtl_state.viewport_did_change = true;
     mtl_state.needs_resize_depth = true;
+    mtl_state.current_width = width;
+    mtl_state.current_height = height;
     mtl_state.layer->setDrawableSize(CGSizeMake(width, height));
 }
 
@@ -768,11 +770,6 @@ static void gfx_metal_on_resize(void) {
 
 static void gfx_metal_start_frame(void) {
     mtl_state.autorelease_pool = NS::AutoreleasePool::alloc()->init();
-
-    if (mtl_state.needs_resize_depth) {
-        create_depth_texture(mtl_state.viewport.width, mtl_state.viewport.height);
-        mtl_state.needs_resize_depth = false;
-    }
     
     mtl_state.current_drawable = mtl_state.layer->nextDrawable();
     // do nothing for this frame if we can't get a drawable
@@ -780,9 +777,12 @@ static void gfx_metal_start_frame(void) {
         return;
     }
 
-    mtl_state.current_width = mtl_state.layer->drawableSize().width;
-    mtl_state.current_height = mtl_state.layer->drawableSize().height;
+    if (mtl_state.needs_resize_depth) {
+        create_depth_texture(mtl_state.viewport.width, mtl_state.viewport.height);
+        mtl_state.needs_resize_depth = false;
+    }
 
+    printf("cw: %i, %i\n", mtl_state.current_width, mtl_state.current_height);
     mtl_state.current_pass_desc = MTL::RenderPassDescriptor::renderPassDescriptor();
 
     MetalUniforms *u = (MetalUniforms *)mtl_state.uniforms_buffer->contents();
