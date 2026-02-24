@@ -529,7 +529,7 @@ else ifeq ($(findstring SDL,$(WINDOW_API)),SDL)
     BACKEND_LDFLAGS += -lGLESv2
   else ifeq ($(OSX_BUILD),1)
     ifeq ($(RENDER_API),METAL)
-      CXXFLAGS += -Iinclude/metalsdk -std=c++20 -g
+      CXXFLAGS += -Iinclude/metalsdk -std=c++20
 	  BACKEND_LDFLAGS += -framework Foundation -framework Metal -framework QuartzCore -lc++
     else
       BACKEND_LDFLAGS += -framework OpenGL $(shell pkg-config --libs glew)
