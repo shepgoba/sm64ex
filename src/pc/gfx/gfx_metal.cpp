@@ -82,6 +82,7 @@ struct {
     size_t dynamic_offset = 0;
 
     // state stuff
+    bool new_encoder = false;
     bool viewport_did_change = false;
     bool scissor_did_change = false;
     MTL::Viewport viewport;
@@ -597,21 +598,21 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
         return;
     }
 
-    if (mtl_state.viewport_did_change) {
+    if (mtl_state.viewport_did_change || mtl_state.new_encoder) {
         mtl_state.current_encoder->setViewport(mtl_state.viewport);
         mtl_state.viewport_did_change = false;
     }
 
-    if (mtl_state.scissor_did_change) {
-           mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
+    if (mtl_state.scissor_did_change || mtl_state.new_encoder) {
+        mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
         mtl_state.scissor_did_change = false;
     }
 
-    if (mtl_state.active_shader != mtl_state.last_shader) {
+    if (mtl_state.active_shader != mtl_state.last_shader || mtl_state.new_encoder) {
         mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
         mtl_state.last_shader = mtl_state.active_shader;
     }
-    if (mtl_state.zmode_decal != mtl_state.last_zmode_decal) {
+    if (mtl_state.zmode_decal != mtl_state.last_zmode_decal || mtl_state.new_encoder) {
         if (mtl_state.zmode_decal) {
             float slopeScale = -2.0f;
             float clamp = 0.0f;
@@ -622,8 +623,9 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
         }
     }
 
-    if (mtl_state.depth_test != mtl_state.last_depth_test ||
-    	mtl_state.depth_mask != mtl_state.last_depth_mask) {
+    if ((mtl_state.depth_test != mtl_state.last_depth_test ||
+    	mtl_state.depth_mask != mtl_state.last_depth_mask) || 
+        mtl_state.new_encoder) {
         if (mtl_state.depth_test) {
             mtl_state.current_encoder->setDepthStencilState(mtl_state.depth_states[mtl_state.depth_mask ? 1 : 0]);
         } else {
@@ -632,7 +634,7 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
     }
 
     if (mtl_state.active_shader->used_textures[0] &&
-        mtl_state.previous_texture_ids[0] != mtl_state.current_texture_ids[0]) {
+        (mtl_state.previous_texture_ids[0] != mtl_state.current_texture_ids[0] || mtl_state.new_encoder)) {
         uint32_t tex_id1 = mtl_state.current_texture_ids[0];
         TextureDataMetal &td = mtl_state.textures[tex_id1];
         int index = td.sampler_parameters;
@@ -642,7 +644,7 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
     }
 
     if (mtl_state.active_shader->used_textures[1] &&
-        mtl_state.previous_texture_ids[1] != mtl_state.current_texture_ids[1]) {
+        (mtl_state.previous_texture_ids[1] != mtl_state.current_texture_ids[1] || mtl_state.new_encoder)) {
         uint32_t tex_id1 = mtl_state.current_texture_ids[1];
         TextureDataMetal &td = mtl_state.textures[tex_id1];
         int index = td.sampler_parameters;
@@ -665,11 +667,7 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
 
     memcpy(dst, buf_vbo, size);
 
-    mtl_state.current_encoder->setVertexBuffer(
-        mtl_state.dynamic_vertex_buffer,
-        mtl_state.dynamic_offset,
-        0
-    );
+    mtl_state.current_encoder->setVertexBufferOffset(mtl_state.dynamic_offset, 0);
 
     mtl_state.current_encoder->drawPrimitives(
         MTL::PrimitiveTypeTriangle,
@@ -678,6 +676,7 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
     );
 
     mtl_state.dynamic_offset += aligned;
+    mtl_state.new_encoder = false;
 }
 
 
@@ -804,9 +803,14 @@ static void gfx_metal_start_frame(void) {
 
     mtl_state.current_encoder = mtl_state.current_cmd_buffer->renderCommandEncoder(mtl_state.current_pass_desc);
 
-    // must always set the encoder to a pipeline state
-    mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
-    mtl_state.last_shader = mtl_state.active_shader;
+    // make sure new encoder is configured correctly
+    mtl_state.new_encoder = true;
+
+    mtl_state.current_encoder->setVertexBuffer(
+        mtl_state.dynamic_vertex_buffer,
+        mtl_state.dynamic_offset,
+        0
+    );
 }
 
 static void gfx_metal_finish_render(void) {
