@@ -83,6 +83,7 @@ struct {
 
     // state stuff
     bool viewport_did_change = false;
+    bool scissor_did_change = false;
     MTL::Viewport viewport;
     MTL::ScissorRect scissor;
     ShaderProgramMetal *active_shader = nullptr;
@@ -538,7 +539,7 @@ static int gfx_cm_to_index(uint32_t val) {
 
 static void gfx_metal_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
     mtl_state.textures[mtl_state.current_texture_ids[tile]].sampler_parameters =
-    	linear_filter * 9 + gfx_cm_to_index(cms) * 3 + gfx_cm_to_index(cmt);
+        linear_filter * 9 + gfx_cm_to_index(cms) * 3 + gfx_cm_to_index(cmt);
 }
 
 static void gfx_metal_set_depth_test(bool depth_test) {
@@ -557,9 +558,10 @@ static void gfx_metal_set_zmode_decal(bool zmode_decal) {
 }
 
 static void gfx_metal_set_viewport(int x, int y, int width, int height) {
+    double drawable_height = mtl_state.layer->drawableSize().height;
     MTL::Viewport viewport{
         static_cast<double>(x),
-        static_cast<double>(y),
+        static_cast<double>(drawable_height - y - height),
         static_cast<double>(width),
         static_cast<double>(height),
         0.0,
@@ -571,13 +573,15 @@ static void gfx_metal_set_viewport(int x, int y, int width, int height) {
 }
 
 static void gfx_metal_set_scissor(int x, int y, int width, int height) {
+    double drawable_height = mtl_state.layer->drawableSize().height;
     MTL::ScissorRect scissor{
         static_cast<NS::UInteger>(x),
-        static_cast<NS::UInteger>(y),
+        static_cast<NS::UInteger>(drawable_height - y - height),
         static_cast<NS::UInteger>(width),
         static_cast<NS::UInteger>(height)
     };
     mtl_state.scissor = scissor;
+    mtl_state.scissor_did_change = true;
 }
 
 static void gfx_metal_set_use_alpha(bool use_alpha) {
@@ -588,9 +592,19 @@ static void gfx_metal_draw_triangles(float buf_vbo[],
                                      size_t buf_vbo_len,
                                      size_t buf_vbo_num_tris)
 {
-	// do nothing if we failed to get drawable
-	if (!mtl_state.current_drawable) {
-    	return;
+    // do nothing if we failed to get drawable
+    if (!mtl_state.current_drawable) {
+        return;
+    }
+
+    if (mtl_state.viewport_did_change) {
+        mtl_state.current_encoder->setViewport(mtl_state.viewport);
+        mtl_state.viewport_did_change = false;
+    }
+
+    if (mtl_state.scissor_did_change) {
+           mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
+        mtl_state.scissor_did_change = false;
     }
 
     if (mtl_state.active_shader != mtl_state.last_shader) {
@@ -757,7 +771,7 @@ static void gfx_metal_start_frame(void) {
     mtl_state.current_drawable = mtl_state.layer->nextDrawable();
     // do nothing for this frame if we can't get a drawable
     if (!mtl_state.current_drawable) {
-    	return;
+        return;
     }
     mtl_state.current_pass_desc = MTL::RenderPassDescriptor::renderPassDescriptor();
 
@@ -790,10 +804,6 @@ static void gfx_metal_start_frame(void) {
 
     mtl_state.current_encoder = mtl_state.current_cmd_buffer->renderCommandEncoder(mtl_state.current_pass_desc);
 
-    mtl_state.current_encoder->setViewport(mtl_state.viewport);
-    mtl_state.current_encoder->setScissorRect(mtl_state.scissor);
-    mtl_state.current_encoder->setDepthClipMode(MTL::DepthClipModeClamp);
-
     // must always set the encoder to a pipeline state
     mtl_state.current_encoder->setRenderPipelineState(mtl_state.active_shader->pipeline);
     mtl_state.last_shader = mtl_state.active_shader;
@@ -803,9 +813,9 @@ static void gfx_metal_finish_render(void) {
 }
 
 static void gfx_metal_end_frame(void) {
-	// like start_frame and draw triangles, skip this frame
-	if (!mtl_state.current_drawable) {
-    	goto done;
+    // like start_frame and draw triangles, skip this frame
+    if (!mtl_state.current_drawable) {
+        goto done;
     }
 
     mtl_state.current_encoder->endEncoding();
